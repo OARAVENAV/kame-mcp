@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "kame-erp": {
+      "command": "python",
+      "args": ["C:\\ruta\\a\\kame-mcp\\server.py"],
+      "env": {
+        "KAME_CLIENT_ID": "pega_aqui_tu_client_id",
+        "KAME_CLIENT_SECRET": "pega_aqui_tu_client_secret"
+      }
+    }
+  }
+}
