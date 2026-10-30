@@ -16,7 +16,7 @@ from typing import Any
 CLIENT_ID     = os.environ.get("KAME_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("KAME_CLIENT_SECRET", "")
 BASE_URL      = "https://api.kameone.cl/api"
-AUTH_URL      = "https://auth.kameone.cl/oauth/token"   # Auth0
+AUTH_URL      = "https://api.kameone.cl/oauth/token"    # Auth0
 AUDIENCE      = "https://api.kameone.cl/api"
 
 # ─── Manejo de token Auth0 ────────────────────────────────────────────────────
