@@ -14,7 +14,8 @@ Servidor MCP que conecta Claude con la API de Kame ERP (api.kameone.cl) para con
 | Compras | `kame_informe_compras` | Facturas de compra del mes (todas las páginas) |
 | | `kame_detalle_compra` | Detalle de una factura de compra |
 | | `kame_oc_referenciadas` | OC referenciadas en las facturas de compra del mes |
-| Órdenes de compra | `kame_crear_orden_compra` | Crea una OC (calcula IVA, totales y cuotas) |
+| Órdenes de compra | `kame_listar_ordenes_compra` | Lista las OC de un rango de fechas con estado, recepción, facturación, líneas e ID interno (vía web) |
+| | `kame_crear_orden_compra` | Crea una OC (calcula IVA, totales y cuotas) |
 | | `kame_cerrar_orden_compra` | Cierra manualmente una OC aprobada |
 | Inventario | `kame_stock_general`, `kame_stock_articulo`, `kame_stock_bodega`, `kame_stock_articulo_bodega` | Stock |
 | Cobros | `kame_cuentas_por_cobrar`, `kame_informe_cobros` | Deudores y cobros |
@@ -24,7 +25,7 @@ Servidor MCP que conecta Claude con la API de Kame ERP (api.kameone.cl) para con
 
 ### Sobre las órdenes de compra
 
-- **La API de Kame no permite listar OC.** `kame_oc_referenciadas` las reconstruye a partir de las facturas de compra que las referencian. Las OC que todavía no tienen factura no aparecen.
+- **La API de Kame no permite listar OC.** `kame_listar_ordenes_compra` inicia sesión en la web de Kame con `KAME_WEB_EMAIL` / `KAME_WEB_CLAVE` y lee el "Informe de Órdenes de Compra". Si Kame cambia esa página, esta herramienta puede dejar de funcionar; en ese caso `kame_oc_referenciadas` sigue disponible (solo ve OC que ya tienen factura).
 - **Crear y cerrar son operaciones que escriben en Kame.** Por defecto (`confirmar=false`) solo devuelven una vista previa con los montos calculados. Claude debe mostrarte esa vista previa y enviar con `confirmar=true` únicamente después de que la apruebes.
 - `kame_cerrar_orden_compra` pide el **ID interno** de la OC, no el folio.
 
@@ -48,6 +49,7 @@ Servidor MCP que conecta Claude con la API de Kame ERP (api.kameone.cl) para con
 |---|---|---|
 | `KAME_CLIENT_ID` / `KAME_CLIENT_SECRET` | Sí | Kame → Datos de empresa → Cliente ID / Cliente Secret |
 | `KAME_USUARIO` | Para crear/cerrar OC | Correo del usuario Kame con el que se registran las OC |
+| `KAME_WEB_EMAIL` / `KAME_WEB_CLAVE` | Para listar OC | Usuario y clave con que entras a www.kameone.cl. **Solo en tu PC.** Idealmente un usuario Kame dedicado, de solo lectura |
 | `KAME_BODEGA_DEFAULT` | No | Bodega por defecto de las OC (default `Bismarck`) |
 | `KAME_UNIDAD_NEGOCIO_DEFAULT` | No | Unidad de negocio por defecto (default `Casa Matriz`) |
 

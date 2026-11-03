@@ -10,6 +10,8 @@ import sys
 import os
 import time
 import requests
+from html.parser import HTMLParser
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -29,6 +31,12 @@ TASA_IVA              = 0.19
 # En el informe de compras Kame marca las referencias a OC con el código "23";
 # en el detalle aparecen como "Orden de Compra". 801 es el código SII de OC.
 CODIGOS_REF_OC = {"23", "801"}
+
+# Acceso a la web de Kame (solo para el informe de órdenes de compra, que la API no ofrece).
+# Se configuran SOLO en el claude_desktop_config.json de tu computador, nunca en GitHub.
+WEB_URL   = "https://www.kameone.cl"
+WEB_EMAIL = os.environ.get("KAME_WEB_EMAIL", "")
+WEB_CLAVE = os.environ.get("KAME_WEB_CLAVE", "")
 
 # ─── Manejo de token Auth0 ────────────────────────────────────────────────────
 _token_cache = {"token": None, "expires_at": 0}
@@ -213,6 +221,24 @@ TOOLS = [
         },
     },
     # ── ÓRDENES DE COMPRA ─────────────────────────────────────────────────────
+    {
+        "name": "kame_listar_ordenes_compra",
+        "description": (
+            "Lista las órdenes de compra emitidas en un rango de fechas, con estado, facturación, recepción, "
+            "líneas y el ID interno de cada OC (el que pide kame_cerrar_orden_compra). Lee el 'Informe de "
+            "Órdenes de Compra' de la web de Kame porque la API no lo ofrece."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "fecha_desde": {"type": "string", "description": "YYYY-MM-DD"},
+                "fecha_hasta": {"type": "string", "description": "YYYY-MM-DD"},
+                "texto":       {"type": "string", "description": "Filtro opcional: RUT, proveedor, SKU o producto (contiene)"},
+                "solo_pendientes": {"type": "boolean", "description": "Solo OC con recepción o facturación pendiente"},
+            },
+            "required": ["fecha_desde", "fecha_hasta"],
+        },
+    },
     {
         "name": "kame_crear_orden_compra",
         "description": (
@@ -610,6 +636,101 @@ def oc_referenciadas(mes: int, anio: int) -> dict:
         "facturas_sin_referencia_a_oc": sin_oc,
     }
 
+# ─── Web de Kame: informe de órdenes de compra ───────────────────────────────
+_web = {"sesion": None}
+
+class _TablaOC(HTMLParser):
+    """Extrae filas de la tabla #informeOC (texto de cada celda + id interno del enlace de folio)."""
+    def __init__(self):
+        super().__init__()
+        self.en_tabla = False; self.prof = 0
+        self.filas = []; self.fila = None; self.celda = None; self.id_oc = None
+        self.inputs = {}
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "input" and a.get("name"):
+            self.inputs[a["name"]] = a.get("value") or ""
+        if tag == "table" and a.get("id") == "informeOC":
+            self.en_tabla = True; self.prof = 0
+        if not self.en_tabla: return
+        if tag == "table": self.prof += 1
+        elif tag == "tr": self.fila = []; self.id_oc = None
+        elif tag in ("td", "th") and self.fila is not None: self.celda = []
+        elif tag == "a" and a.get("href"):
+            m = re.search(r"EmisionOrdenCompraPDF\?id=(\d+)", a["href"])
+            if m: self.id_oc = int(m.group(1))
+    def handle_endtag(self, tag):
+        if not self.en_tabla: return
+        if tag in ("td", "th") and self.celda is not None and self.fila is not None:
+            self.fila.append(" ".join("".join(self.celda).split())); self.celda = None
+        elif tag == "tr" and self.fila is not None:
+            self.filas.append((self.fila, self.id_oc)); self.fila = None
+        elif tag == "table":
+            self.prof -= 1
+            if self.prof <= 0: self.en_tabla = False
+    def handle_data(self, data):
+        if self.celda is not None: self.celda.append(data)
+
+def _web_login() -> requests.Session:
+    if not WEB_EMAIL or not WEB_CLAVE:
+        raise ValueError("Falta configurar KAME_WEB_EMAIL y KAME_WEB_CLAVE en el claude_desktop_config.json de tu computador")
+    s = requests.Session()
+    s.headers["User-Agent"] = "Mozilla/5.0 (kame-mcp)"
+    p = _TablaOC(); p.feed(s.get(f"{WEB_URL}/Login", timeout=30).text)
+    datos = {**p.inputs, "Email": WEB_EMAIL, "Contrasena": WEB_CLAVE}
+    r = s.post(f"{WEB_URL}/Login", data=datos, timeout=30)
+    r.raise_for_status()
+    if "/Login" in r.url and 'name="Contrasena"' in r.text:
+        raise ValueError("Kame rechazó el inicio de sesión web: revisa KAME_WEB_EMAIL / KAME_WEB_CLAVE")
+    return s
+
+def _num(t: str) -> float:
+    t = (t or "").replace("$", "").replace(",", "").strip()
+    try: return float(t)
+    except ValueError: return 0.0
+
+def listar_ordenes_compra(desde: str, hasta: str, texto: str = "", solo_pendientes: bool = False) -> dict:
+    f = lambda x: datetime.strptime(x[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    params = {"periodoD": f(desde), "periodoH": f(hasta), "proveedor": "", "familia": "", "articulo": "",
+              "estadoOc": "", "unidadNegocio": "", "estadoFacturacion": "", "estadoRecepcion": "", "comprador": ""}
+    for intento in (1, 2):
+        if _web["sesion"] is None:
+            _web["sesion"] = _web_login()
+        r = _web["sesion"].get(f"{WEB_URL}/Reporte/EmisionInformeOrdenesCompra", params=params, timeout=60)
+        if 'id="informeOC"' in r.text:
+            break
+        _web["sesion"] = None          # sesión vencida: reintenta con login nuevo
+    else:
+        raise ValueError("No se pudo leer el informe de órdenes de compra desde la web de Kame")
+
+    p = _TablaOC(); p.feed(r.text)
+    ordenes = {}
+    for celdas, id_oc in p.filas:
+        if len(celdas) != 22 or not celdas[0].isdigit():
+            continue
+        (_, rut, prov, fecha, doc, folio, f_rec, fact, recep, estado, _usr, obs, un, comprador,
+         producto, sku, c_oc, c_rec, x_rec, c_fac, x_fac, total) = celdas
+        o = ordenes.setdefault(folio, {
+            "folio": folio, "id_interno": id_oc, "rut": rut, "proveedor": prov, "fecha": fecha,
+            "documento_esperado": doc.replace("ORDEN COMPRA", "").strip(" []"),
+            "fecha_recepcion": f_rec, "estado_oc": estado, "facturacion": fact, "recepcion": recep,
+            "comprador": comprador, "unidad_negocio": un, "ultimo_seguimiento": obs,
+            "lineas": [], "total_neto": 0.0,
+        })
+        o["lineas"].append({"sku": sku, "producto": producto, "cantidad": _num(c_oc), "recibida": _num(c_rec),
+                            "por_recibir": _num(x_rec), "facturada": _num(c_fac), "por_facturar": _num(x_fac),
+                            "total": _num(total)})
+        o["total_neto"] += _num(total)
+
+    lista = list(ordenes.values())
+    if texto:
+        t = texto.lower()
+        lista = [o for o in lista if t in json.dumps(o, ensure_ascii=False).lower()]
+    if solo_pendientes:
+        lista = [o for o in lista if o["facturacion"] != "Completa" or o["recepcion"] != "Completa"]
+    return {"periodo": f"{params['periodoD']} al {params['periodoH']}", "cantidad": len(lista),
+            "total_neto": sum(o["total_neto"] for o in lista), "ordenes_de_compra": lista}
+
 # ─── Ejecución de herramientas ────────────────────────────────────────────────
 def ejecutar(nombre: str, args: dict) -> str:
     try:
@@ -654,6 +775,9 @@ def ejecutar(nombre: str, args: dict) -> str:
             data = oc_referenciadas(args["mes"], args["anio"])
 
         # ÓRDENES DE COMPRA
+        elif nombre == "kame_listar_ordenes_compra":
+            data = listar_ordenes_compra(args["fecha_desde"], args["fecha_hasta"],
+                                         args.get("texto", ""), args.get("solo_pendientes", False))
         elif nombre == "kame_crear_orden_compra":
             body = construir_orden_compra(args)
             if not args.get("confirmar"):
