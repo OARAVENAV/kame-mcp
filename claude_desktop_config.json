@@ -2,10 +2,15 @@
   "mcpServers": {
     "kame-erp": {
       "command": "python",
-      "args": ["C:\\ruta\\a\\kame-mcp\\server.py"],
+      "args": [
+        "C:\\ruta\\a\\kame-mcp\\server.py"
+      ],
       "env": {
         "KAME_CLIENT_ID": "pega_aqui_tu_client_id",
-        "KAME_CLIENT_SECRET": "pega_aqui_tu_client_secret"
+        "KAME_CLIENT_SECRET": "pega_aqui_tu_client_secret",
+        "KAME_USUARIO": "correo_usuario_kame@dominio.cl",
+        "KAME_BODEGA_DEFAULT": "Bismarck",
+        "KAME_UNIDAD_NEGOCIO_DEFAULT": "Casa Matriz"
       }
     }
   }
