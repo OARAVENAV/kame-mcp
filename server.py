@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Servidor MCP para Kame ERP - Ferretería Bismarck SpA
-Versión 3.0 - URLs reales de la API oficial de Kame ERP (api.kameone.cl)
+Versión 3.1 - URLs reales de la API oficial de Kame ERP (api.kameone.cl)
++ Órdenes de compra: crear, cerrar y OC referenciadas en facturas
 """
 
 import json
@@ -9,6 +10,8 @@ import sys
 import os
 import time
 import requests
+from html.parser import HTMLParser
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -18,6 +21,22 @@ CLIENT_SECRET = os.environ.get("KAME_CLIENT_SECRET", "")
 BASE_URL      = "https://api.kameone.cl/api"
 AUTH_URL      = "https://api.kameone.cl/oauth/token"    # Auth0
 AUDIENCE      = "https://api.kameone.cl/api"
+
+# Datos para crear/cerrar órdenes de compra
+KAME_USUARIO          = os.environ.get("KAME_USUARIO", "")   # correo del usuario Kame que registra la OC
+BODEGA_DEFAULT        = os.environ.get("KAME_BODEGA_DEFAULT", "Bismarck")
+UNIDAD_NEGOCIO_DEFAULT = os.environ.get("KAME_UNIDAD_NEGOCIO_DEFAULT", "Casa Matriz")
+TASA_IVA              = 0.19
+
+# En el informe de compras Kame marca las referencias a OC con el código "23";
+# en el detalle aparecen como "Orden de Compra". 801 es el código SII de OC.
+CODIGOS_REF_OC = {"23", "801"}
+
+# Acceso a la web de Kame (solo para el informe de órdenes de compra, que la API no ofrece).
+# Se configuran SOLO en el claude_desktop_config.json de tu computador, nunca en GitHub.
+WEB_URL   = "https://www.kameone.cl"
+WEB_EMAIL = os.environ.get("KAME_WEB_EMAIL", "")
+WEB_CLAVE = os.environ.get("KAME_WEB_CLAVE", "")
 
 # ─── Manejo de token Auth0 ────────────────────────────────────────────────────
 _token_cache = {"token": None, "expires_at": 0}
@@ -59,7 +78,24 @@ def GET(path: str, params: dict = None) -> Any:
 def POST(path: str, body: dict) -> Any:
     resp = requests.post(f"{BASE_URL}{path}", headers=hdrs(), json=body, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    if not resp.text.strip():
+        return {}
+    try:
+        return resp.json()
+    except ValueError:
+        return {"respuesta": resp.text}
+
+def GET_TODAS_LAS_PAGINAS(path: str, params: dict, max_paginas: int = 50) -> list:
+    """Recorre todas las páginas de un informe paginado y devuelve los items juntos."""
+    items, pagina = [], 1
+    while pagina <= max_paginas:
+        data = GET(path, {**params, "page": pagina, "per_page": 100})
+        lote = data.get("items", []) if isinstance(data, dict) else []
+        items.extend(lote)
+        if len(lote) < 100:
+            break
+        pagina += 1
+    return items
 
 # ─── Helpers de fecha ─────────────────────────────────────────────────────────
 def rango_mes(mes: int, anio: int):
@@ -166,6 +202,115 @@ TOOLS = [
                 "rut_proveedor": {"type": "string", "description": "RUT del proveedor (ej: 12345678-9)"},
             },
             "required": ["tipo_documento", "folio", "rut_proveedor"],
+        },
+    },
+    {
+        "name": "kame_oc_referenciadas",
+        "description": (
+            "Lista las órdenes de compra que aparecen referenciadas en las facturas de compra del mes "
+            "(la API de Kame no permite listar OC directamente). Agrupa por factura e indica qué facturas "
+            "no referencian ninguna OC. No muestra OC que todavía no tienen factura."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mes":  {"type": "integer", "description": "Mes de las facturas (1-12)"},
+                "anio": {"type": "integer", "description": "Año"},
+            },
+            "required": ["mes", "anio"],
+        },
+    },
+    # ── ÓRDENES DE COMPRA ─────────────────────────────────────────────────────
+    {
+        "name": "kame_listar_ordenes_compra",
+        "description": (
+            "Lista las órdenes de compra emitidas en un rango de fechas, con estado, facturación, recepción, "
+            "líneas y el ID interno de cada OC (el que pide kame_cerrar_orden_compra). Lee el 'Informe de "
+            "Órdenes de Compra' de la web de Kame porque la API no lo ofrece."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "fecha_desde": {"type": "string", "description": "YYYY-MM-DD"},
+                "fecha_hasta": {"type": "string", "description": "YYYY-MM-DD"},
+                "texto":       {"type": "string", "description": "Filtro opcional: RUT, proveedor, SKU o producto (contiene)"},
+                "solo_pendientes": {"type": "boolean", "description": "Solo OC con recepción o facturación pendiente"},
+            },
+            "required": ["fecha_desde", "fecha_hasta"],
+        },
+    },
+    {
+        "name": "kame_crear_orden_compra",
+        "description": (
+            "Crea una orden de compra en Kame. Calcula neto, IVA, total y cuotas automáticamente. "
+            "IMPORTANTE: con confirmar=false (por defecto) NO envía nada: devuelve una vista previa con los "
+            "montos para revisarla con el usuario. Solo usar confirmar=true después de que el usuario "
+            "apruebe explícitamente esa vista previa."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rut_proveedor":  {"type": "string", "description": "RUT del proveedor (ej: 77.101.910-2)"},
+                "razon_social":   {"type": "string", "description": "Razón social del proveedor"},
+                "comentario":     {"type": "string", "description": "Glosa de la OC (máx. 255 caracteres)"},
+                "lineas": {
+                    "type": "array",
+                    "description": "Líneas de la OC",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "descripcion":     {"type": "string", "description": "Descripción del ítem"},
+                            "sku":             {"type": "string", "description": "SKU del artículo (obligatorio si es inventariable)"},
+                            "cantidad":        {"type": "number"},
+                            "precio_unitario": {"type": "number", "description": "Precio unitario neto (sin IVA)"},
+                            "porc_descuento":  {"type": "number", "description": "Descuento % de la línea (default 0)"},
+                            "unidad_medida":   {"type": "string", "description": "Default 'UN'"},
+                            "tipo_articulo":   {"type": "string", "enum": ["ARTICULO", "SERVICIO", "ACTIVOFIJO"], "description": "Default 'ARTICULO'"},
+                            "descripcion_detallada": {"type": "string"},
+                        },
+                        "required": ["descripcion", "cantidad", "precio_unitario"],
+                    },
+                },
+                "fecha":          {"type": "string", "description": "Fecha de la OC YYYY-MM-DD (default hoy)"},
+                "fecha_recepcion": {"type": "string", "description": "Fecha de recepción esperada YYYY-MM-DD (default = fecha)"},
+                "documento": {
+                    "type": "string",
+                    "description": "Documento esperado: 'Factura Electrónica' (default), 'Factura Exenta Electrónica', 'Factura de Compra Electrónica', 'Factura', 'Factura Exenta'",
+                },
+                "forma_pago":     {"type": "string", "enum": ["contado", "credito"], "description": "Default 'credito'"},
+                "numero_cuotas":  {"type": "integer", "description": "Cuotas si es crédito (default 1)"},
+                "dias_primer_vencimiento": {"type": "integer", "description": "Días desde la fecha hasta la 1ª cuota (default 30)"},
+                "dias_entre_cuotas": {"type": "integer", "description": "Días entre cuotas (default 30)"},
+                "bodega":         {"type": "string", "description": f"Bodega de recepción (default '{BODEGA_DEFAULT}')"},
+                "es_inventariable": {"type": "boolean", "description": "Default true"},
+                "unidad_negocio": {"type": "string", "description": f"Default '{UNIDAD_NEGOCIO_DEFAULT}'"},
+                "comprador":      {"type": "string", "description": "Nombre del comprador"},
+                "observacion":    {"type": "string", "description": "Observación (máx. 6000 caracteres)"},
+                "folio":          {"type": "integer", "description": "Folio manual (0 o vacío = automático)"},
+                "giro":           {"type": "string"},
+                "direccion":      {"type": "string"},
+                "ciudad":         {"type": "string"},
+                "comuna":         {"type": "string"},
+                "confirmar":      {"type": "boolean", "description": "false = solo vista previa (default). true = enviar a Kame."},
+            },
+            "required": ["rut_proveedor", "razon_social", "comentario", "lineas"],
+        },
+    },
+    {
+        "name": "kame_cerrar_orden_compra",
+        "description": (
+            "Cierra manualmente una orden de compra aprobada (queda 'Cerrado Manual' y ya no admite recepciones). "
+            "Requiere el ID interno de la OC, no el folio. Con confirmar=false (default) no envía nada; "
+            "usar confirmar=true solo después de que el usuario lo apruebe."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id_orden_compra": {"type": "integer", "description": "ID interno de la OC en Kame (no el folio)"},
+                "observacion":     {"type": "string", "description": "Motivo del cierre (queda en el seguimiento)"},
+                "confirmar":       {"type": "boolean", "description": "false = solo vista previa (default). true = cerrar en Kame."},
+            },
+            "required": ["id_orden_compra", "observacion"],
         },
     },
     # ── INVENTARIO ────────────────────────────────────────────────────────────
@@ -320,6 +465,272 @@ TOOLS = [
     },
 ]
 
+# ─── Órdenes de compra ────────────────────────────────────────────────────────
+def _fecha_iso(texto: str = None) -> datetime:
+    if not texto:
+        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return datetime.strptime(texto[:10], "%Y-%m-%d")
+
+def _iso(d: datetime) -> str:
+    return d.strftime("%Y-%m-%dT00:00:00")
+
+def construir_orden_compra(args: dict) -> dict:
+    """Arma el cuerpo de addOrdenCompra a partir de datos simples, calculando montos."""
+    if not KAME_USUARIO:
+        raise ValueError("Falta configurar KAME_USUARIO (correo del usuario Kame) en claude_desktop_config.json")
+    lineas = args.get("lineas") or []
+    if not lineas:
+        raise ValueError("La OC debe tener al menos una línea")
+    comentario = (args.get("comentario") or "").strip()
+    if not comentario:
+        raise ValueError("El comentario (glosa) es obligatorio")
+    if len(comentario) > 255:
+        raise ValueError("El comentario no puede superar 255 caracteres")
+
+    documento       = args.get("documento") or "Factura Electrónica"
+    exenta          = "exenta" in documento.lower()
+    compra_elect    = documento == "Factura de Compra Electrónica"
+    inventariable   = args.get("es_inventariable", True)
+    unidad_negocio  = args.get("unidad_negocio") or UNIDAD_NEGOCIO_DEFAULT
+    fecha           = _fecha_iso(args.get("fecha"))
+    fecha_recepcion = _fecha_iso(args.get("fecha_recepcion")) if args.get("fecha_recepcion") else fecha
+
+    detalle, suma_lineas = [], 0
+    for i, l in enumerate(lineas, 1):
+        cantidad = float(l["cantidad"])
+        precio   = float(l["precio_unitario"])
+        pct      = float(l.get("porc_descuento") or 0)
+        if cantidad <= 0 or precio < 0:
+            raise ValueError(f"Línea {i}: cantidad debe ser > 0 y precio >= 0")
+        tipo_art = l.get("tipo_articulo") or "ARTICULO"
+        if inventariable and tipo_art == "ARTICULO" and not l.get("sku"):
+            raise ValueError(f"Línea {i}: falta el SKU (obligatorio para artículos inventariables)")
+        bruto     = round(cantidad * precio)
+        total_lin = round(bruto * (1 - pct / 100))
+        suma_lineas += total_lin
+        item = {
+            "Descripcion":          l["descripcion"],
+            "DescripcionDetallada": (l.get("descripcion_detallada") or "")[:1024],
+            "Cantidad":             cantidad,
+            "UnidadNegocio":        unidad_negocio,
+            "UnidadMedida":         l.get("unidad_medida") or "UN",
+            "PrecioUnitario":       precio,
+            "PorcDescuento":        pct,
+            "Descuento":            bruto - total_lin,
+            "Total":                total_lin,
+            "TipoArticulo":         tipo_art,
+        }
+        if l.get("sku"):
+            item["Articulo"] = l["sku"]
+        detalle.append(item)
+
+    afecto = 0 if exenta else suma_lineas
+    exento = suma_lineas if exenta else 0
+    iva    = 0 if exenta else round(afecto * TASA_IVA)
+    total  = afecto + exento + iva
+
+    body = {
+        "Usuario":        KAME_USUARIO,
+        "TipoDocumento":  "ORDENCOMPRA",
+        "Documento":      documento,
+        "Rut":            args["rut_proveedor"],
+        "RznSocial":      args["razon_social"],
+        "Fecha":          _iso(fecha),
+        "Folio":          int(args.get("folio") or 0),
+        "FechaRecepcion": _iso(fecha_recepcion),
+        "Giro":           args.get("giro", ""),
+        "Direccion":      args.get("direccion", ""),
+        "Ciudad":         args.get("ciudad", ""),
+        "Comuna":         args.get("comuna", ""),
+        "Pais":           "Chile",
+        "Comentario":     comentario,
+        "TipoCompra":     "Del Giro",
+        "Comprador":      args.get("comprador", ""),
+        "Observacion":    (args.get("observacion") or "")[:6000],
+        "EsInventariable": "S" if inventariable else "",
+        "Detalle":        detalle,
+        "Afecto":         afecto,
+        "Exento":         exento,
+        "Descuento":      0,
+        "PorcDescuento":  0.0,
+        "Recargo":        0,
+        "PorcRecargo":    0.0,
+        "TipoImpto1":     "IVA",
+        "ValorImpto1":    iva,
+        "IvaNoRecuperable": "No aplica",
+        "total":          total,
+    }
+    if inventariable and any(d["TipoArticulo"] == "ARTICULO" for d in detalle):
+        body["Bodega"] = args.get("bodega") or BODEGA_DEFAULT
+    if compra_elect:
+        body["TipoImpto2"]  = "IVA Retenido"
+        body["ValorImpto2"] = iva
+
+    if (args.get("forma_pago") or "credito") == "contado":
+        body["FormaPago"] = "1"
+        body["FechaVencimiento"] = _iso(fecha)
+    else:
+        n        = max(1, int(args.get("numero_cuotas") or 1))
+        primer   = int(args.get("dias_primer_vencimiento") if args.get("dias_primer_vencimiento") is not None else 30)
+        entre    = int(args.get("dias_entre_cuotas") or 30)
+        base     = total // n
+        cuotas   = []
+        for k in range(n):
+            monto = base if k < n - 1 else total - base * (n - 1)   # la última ajusta la diferencia
+            cuotas.append({"FechaPago": _iso(fecha + timedelta(days=primer + k * entre)), "MontoPago": float(monto)})
+        body["FormaPago"]        = "2"
+        body["Cuotas"]           = cuotas
+        body["FechaVencimiento"] = cuotas[-1]["FechaPago"]
+    return body
+
+def resumen_oc(body: dict) -> dict:
+    return {
+        "proveedor": f"{body['RznSocial']} ({body['Rut']})",
+        "fecha":     body["Fecha"][:10],
+        "lineas":    [f"{d['Cantidad']:g} x {d['Descripcion']} @ ${d['PrecioUnitario']:,.0f} = ${d['Total']:,.0f}"
+                      for d in body["Detalle"]],
+        "neto":      body["Afecto"] + body["Exento"],
+        "iva":       body["ValorImpto1"],
+        "total":     body["total"],
+        "forma_pago": "Contado" if body["FormaPago"] == "1" else f"Crédito, {len(body['Cuotas'])} cuota(s)",
+        "bodega":    body.get("Bodega", "(no inventariable)"),
+    }
+
+def oc_referenciadas(mes: int, anio: int) -> dict:
+    """Agrupa el informe de compras por factura y extrae las referencias a OC."""
+    desde, hasta = rango_mes(mes, anio)
+    filas = GET_TODAS_LAS_PAGINAS("/Documento/getInformeCompras", {"fechaDesde": desde, "fechaHasta": hasta})
+
+    facturas = {}
+    for f in filas:
+        clave = (f.get("Rut"), f.get("Documento"), f.get("Folio"))
+        fac = facturas.setdefault(clave, {
+            "proveedor": f.get("RznSocial"), "rut": f.get("Rut"),
+            "documento": f.get("Documento"), "folio": f.get("Folio"),
+            "fecha": (f.get("Fecha") or "")[:10], "comentario": f.get("Comentario"),
+            "total": 0,
+            "_ocs": {},
+        })
+        fac["total"] += f.get("Total") or 0   # el informe trae una fila por línea de detalle
+        for n in (1, 2, 3):
+            tipo  = str(f.get(f"NombreRef{n}") or "").strip()
+            folio = str(f.get(f"FolioRef{n}") or "").strip()
+            if folio and (tipo in CODIGOS_REF_OC or "orden de compra" in tipo.lower()):
+                fac["_ocs"][folio] = (f.get(f"FechaRef{n}") or "")[:10]
+
+    ordenes, sin_oc = {}, []
+    for fac in facturas.values():
+        ocs = fac.pop("_ocs")
+        if not ocs:
+            sin_oc.append(fac)
+        for folio_oc, fecha_oc in ocs.items():
+            o = ordenes.setdefault(folio_oc, {"folio_oc": folio_oc, "fecha_oc": fecha_oc,
+                                              "proveedor": fac["proveedor"], "facturas": []})
+            o["facturas"].append({"folio": fac["folio"], "fecha": fac["fecha"], "total": fac["total"]})
+
+    return {
+        "periodo": f"{mes:02d}/{anio}",
+        "nota": "Solo incluye OC referenciadas en facturas de compra de este mes. "
+                "Las OC aún sin factura no aparecen (la API de Kame no permite listarlas).",
+        "ordenes_de_compra": sorted(ordenes.values(), key=lambda o: o["folio_oc"]),
+        "facturas_sin_referencia_a_oc": sin_oc,
+    }
+
+# ─── Web de Kame: informe de órdenes de compra ───────────────────────────────
+_web = {"sesion": None}
+
+class _TablaOC(HTMLParser):
+    """Extrae filas de la tabla #informeOC (texto de cada celda + id interno del enlace de folio)."""
+    def __init__(self):
+        super().__init__()
+        self.en_tabla = False; self.prof = 0
+        self.filas = []; self.fila = None; self.celda = None; self.id_oc = None
+        self.inputs = {}
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "input" and a.get("name"):
+            self.inputs[a["name"]] = a.get("value") or ""
+        if tag == "table" and a.get("id") == "informeOC":
+            self.en_tabla = True; self.prof = 0
+        if not self.en_tabla: return
+        if tag == "table": self.prof += 1
+        elif tag == "tr": self.fila = []; self.id_oc = None
+        elif tag in ("td", "th") and self.fila is not None: self.celda = []
+        elif tag == "a" and a.get("href"):
+            m = re.search(r"EmisionOrdenCompraPDF\?id=(\d+)", a["href"])
+            if m: self.id_oc = int(m.group(1))
+    def handle_endtag(self, tag):
+        if not self.en_tabla: return
+        if tag in ("td", "th") and self.celda is not None and self.fila is not None:
+            self.fila.append(" ".join("".join(self.celda).split())); self.celda = None
+        elif tag == "tr" and self.fila is not None:
+            self.filas.append((self.fila, self.id_oc)); self.fila = None
+        elif tag == "table":
+            self.prof -= 1
+            if self.prof <= 0: self.en_tabla = False
+    def handle_data(self, data):
+        if self.celda is not None: self.celda.append(data)
+
+def _web_login() -> requests.Session:
+    if not WEB_EMAIL or not WEB_CLAVE:
+        raise ValueError("Falta configurar KAME_WEB_EMAIL y KAME_WEB_CLAVE en el claude_desktop_config.json de tu computador")
+    s = requests.Session()
+    s.headers["User-Agent"] = "Mozilla/5.0 (kame-mcp)"
+    p = _TablaOC(); p.feed(s.get(f"{WEB_URL}/Login", timeout=30).text)
+    datos = {**p.inputs, "Email": WEB_EMAIL, "Contrasena": WEB_CLAVE}
+    r = s.post(f"{WEB_URL}/Login", data=datos, timeout=30)
+    r.raise_for_status()
+    if "/Login" in r.url and 'name="Contrasena"' in r.text:
+        raise ValueError("Kame rechazó el inicio de sesión web: revisa KAME_WEB_EMAIL / KAME_WEB_CLAVE")
+    return s
+
+def _num(t: str) -> float:
+    t = (t or "").replace("$", "").replace(",", "").strip()
+    try: return float(t)
+    except ValueError: return 0.0
+
+def listar_ordenes_compra(desde: str, hasta: str, texto: str = "", solo_pendientes: bool = False) -> dict:
+    f = lambda x: datetime.strptime(x[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    params = {"periodoD": f(desde), "periodoH": f(hasta), "proveedor": "", "familia": "", "articulo": "",
+              "estadoOc": "", "unidadNegocio": "", "estadoFacturacion": "", "estadoRecepcion": "", "comprador": ""}
+    for intento in (1, 2):
+        if _web["sesion"] is None:
+            _web["sesion"] = _web_login()
+        r = _web["sesion"].get(f"{WEB_URL}/Reporte/EmisionInformeOrdenesCompra", params=params, timeout=60)
+        if 'id="informeOC"' in r.text:
+            break
+        _web["sesion"] = None          # sesión vencida: reintenta con login nuevo
+    else:
+        raise ValueError("No se pudo leer el informe de órdenes de compra desde la web de Kame")
+
+    p = _TablaOC(); p.feed(r.text)
+    ordenes = {}
+    for celdas, id_oc in p.filas:
+        if len(celdas) != 22 or not celdas[0].isdigit():
+            continue
+        (_, rut, prov, fecha, doc, folio, f_rec, fact, recep, estado, _usr, obs, un, comprador,
+         producto, sku, c_oc, c_rec, x_rec, c_fac, x_fac, total) = celdas
+        o = ordenes.setdefault(folio, {
+            "folio": folio, "id_interno": id_oc, "rut": rut, "proveedor": prov, "fecha": fecha,
+            "documento_esperado": doc.replace("ORDEN COMPRA", "").strip(" []"),
+            "fecha_recepcion": f_rec, "estado_oc": estado, "facturacion": fact, "recepcion": recep,
+            "comprador": comprador, "unidad_negocio": un, "ultimo_seguimiento": obs,
+            "lineas": [], "total_neto": 0.0,
+        })
+        o["lineas"].append({"sku": sku, "producto": producto, "cantidad": _num(c_oc), "recibida": _num(c_rec),
+                            "por_recibir": _num(x_rec), "facturada": _num(c_fac), "por_facturar": _num(x_fac),
+                            "total": _num(total)})
+        o["total_neto"] += _num(total)
+
+    lista = list(ordenes.values())
+    if texto:
+        t = texto.lower()
+        lista = [o for o in lista if t in json.dumps(o, ensure_ascii=False).lower()]
+    if solo_pendientes:
+        lista = [o for o in lista if o["facturacion"] != "Completa" or o["recepcion"] != "Completa"]
+    return {"periodo": f"{params['periodoD']} al {params['periodoH']}", "cantidad": len(lista),
+            "total_neto": sum(o["total_neto"] for o in lista), "ordenes_de_compra": lista}
+
 # ─── Ejecución de herramientas ────────────────────────────────────────────────
 def ejecutar(nombre: str, args: dict) -> str:
     try:
@@ -353,13 +764,46 @@ def ejecutar(nombre: str, args: dict) -> str:
         # COMPRAS
         elif nombre == "kame_informe_compras":
             desde, hasta = rango_mes(args["mes"], args["anio"])
-            data = GET("/Documento/getInformeCompras", {
-                "page": 1, "per_page": 100,
+            items = GET_TODAS_LAS_PAGINAS("/Documento/getInformeCompras", {
                 "fechaDesde": desde, "fechaHasta": hasta,
             })
+            data = {"items": items, "total_filas": len(items)}
         elif nombre == "kame_detalle_compra":
             tipo = requests.utils.quote(args["tipo_documento"])
             data = GET(f"/Documento/getCompra/{tipo}/{args['folio']}/{args['rut_proveedor']}")
+        elif nombre == "kame_oc_referenciadas":
+            data = oc_referenciadas(args["mes"], args["anio"])
+
+        # ÓRDENES DE COMPRA
+        elif nombre == "kame_listar_ordenes_compra":
+            data = listar_ordenes_compra(args["fecha_desde"], args["fecha_hasta"],
+                                         args.get("texto", ""), args.get("solo_pendientes", False))
+        elif nombre == "kame_crear_orden_compra":
+            body = construir_orden_compra(args)
+            if not args.get("confirmar"):
+                data = {
+                    "vista_previa": True,
+                    "mensaje": "NO se ha enviado nada a Kame. Revisa los datos con el usuario y, "
+                               "si los aprueba, vuelve a llamar con confirmar=true.",
+                    "resumen": resumen_oc(body),
+                    "json_a_enviar": body,
+                }
+            else:
+                respuesta = POST("/Documento/addOrdenCompra", body)
+                data = {"enviado": True, "resumen": resumen_oc(body), "respuesta_kame": respuesta}
+        elif nombre == "kame_cerrar_orden_compra":
+            if not KAME_USUARIO:
+                raise ValueError("Falta configurar KAME_USUARIO en claude_desktop_config.json")
+            id_oc = int(args["id_orden_compra"])
+            if id_oc <= 0:
+                raise ValueError("id_orden_compra debe ser mayor que 0")
+            body = {"idOrdenCompra": id_oc, "observacion": args["observacion"], "usuario": KAME_USUARIO}
+            if not args.get("confirmar"):
+                data = {"vista_previa": True,
+                        "mensaje": "NO se ha cerrado nada. Si el usuario lo aprueba, llama con confirmar=true.",
+                        "json_a_enviar": body}
+            else:
+                data = {"enviado": True, "respuesta_kame": POST("/Documento/cerrarManualOrdenCompra", body)}
 
         # INVENTARIO
         elif nombre == "kame_stock_general":
@@ -456,7 +900,7 @@ def handle(msg: dict):
             "jsonrpc": "2.0", "id": mid,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "kame-mcp", "version": "3.0.0"},
+                "serverInfo": {"name": "kame-mcp", "version": "3.1.0"},
                 "capabilities": {"tools": {}},
             },
         })
@@ -467,11 +911,12 @@ def handle(msg: dict):
         nombre    = params.get("name", "")
         args      = params.get("arguments", {})
         resultado = ejecutar(nombre, args)
+        es_error  = resultado.startswith('{"error"')
         send({
             "jsonrpc": "2.0", "id": mid,
             "result": {
                 "content": [{"type": "text", "text": resultado}],
-                "isError": False,
+                "isError": es_error,
             },
         })
     elif method == "notifications/initialized":
