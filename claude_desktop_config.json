@@ -10,9 +10,7 @@
         "KAME_CLIENT_SECRET": "pega_aqui_tu_client_secret",
         "KAME_USUARIO": "correo_usuario_kame@dominio.cl",
         "KAME_BODEGA_DEFAULT": "Bismarck",
-        "KAME_UNIDAD_NEGOCIO_DEFAULT": "Casa Matriz",
-        "KAME_WEB_EMAIL": "tu_correo_de_login_kame",
-        "KAME_WEB_CLAVE": "tu_clave_de_kame_SOLO_EN_TU_PC"
+        "KAME_UNIDAD_NEGOCIO_DEFAULT": "Casa Matriz"
       }
     }
   }
