@@ -10,6 +10,8 @@ import sys
 import os
 import time
 import requests
+import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -21,6 +23,28 @@ CLIENT_SECRET = os.environ.get("KAME_CLIENT_SECRET", "")
 WC_URL            = os.environ.get("WC_URL", "https://bbismarck.cl/wp-json/wc/v3")
 WC_CONSUMER_KEY   = os.environ.get("WC_CONSUMER_KEY", "")
 WC_CONSUMER_SECRET = os.environ.get("WC_CONSUMER_SECRET", "")
+
+# ─── Similitud de nombres (para cruzar web y Kame) ───────────────────────────
+STOP={"de","x","con","para","p","y","el","la","un","und","unid","mm","kg","kgs","mt","mts","metro","metros","ml","gl","cm"}
+SYN={"ang":"angulo","dobl":"doblado","cuad":"cuadrado","cuadr":"cuadrado","rect":"rectangular","rectang":"rectangular","antic":"anticorrosivo","torn":"tornillo","est":"estructural","lam":"laminado","cal":"caliente","lc":"caliente","lf":"frio","galv":"galvanizado","canería":"caneria"}
+def norm(s):
+    s=unicodedata.normalize("NFKD",str(s)).encode("ascii","ignore").decode().lower()
+    s=s.replace(",",".")
+    return s
+def tokens(s):
+    s=norm(s)
+    nums=set(re.findall(r"\d+(?:\.\d+)?",s))
+    nums={n.rstrip("0").rstrip(".") if "." in n else n for n in nums}
+    words={SYN.get(w,w) for w in re.findall(r"[a-z]{2,}",s)}-STOP
+    return nums,words
+def similitud(a,b):
+    na,wa=tokens(a); nb,wb=tokens(b)
+    sn=len(na&nb)/max(1,min(len(na),len(nb))) if (na and nb) else None
+    sw=len(wa&wb)/max(1,min(len(wa),len(wb))) if (wa and wb) else 0
+    if sn is None: return sw
+    if na and nb and not (na<=nb or nb<=na) and sn<0.6: return min(sn,sw)
+    return 0.6*sn+0.4*sw
+
 
 def wc_get(path: str, params: dict = None) -> Any:
     """GET a la API REST de WooCommerce."""
@@ -468,11 +492,12 @@ TOOLS = [
     },
     {
         "name": "wc_comparar_precios",
-        "description": "Compara el precio regular publicado en bbismarck.cl con el PrecioVentaNeto del catálogo de artículos de Kame más IVA (cruce por SKU). Devuelve resumen, diferencias ordenadas de mayor a menor, SKU que no existen en Kame y productos sin SKU.",
+        "description": "Compara el precio regular publicado en bbismarck.cl con el PrecioVentaNeto del catálogo de artículos de Kame más IVA (cruce por SKU). Solo compara precio cuando el nombre coincide; informa aparte los SKU que en Kame son otro producto y los SKU duplicados en Kame. Antes de cambiar precios masivamente, revisar esas dos listas.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "tolerancia_pesos": {"type": "number", "description": "Diferencia máxima en pesos para considerar que coinciden (por defecto 1)"},
+                "umbral_nombre": {"type": "number", "description": "Similitud mínima de nombre (0 a 1) para aceptar que el SKU es el mismo producto (por defecto 0.5)"},
             },
         },
     },
@@ -829,24 +854,41 @@ def ejecutar(nombre: str, args: dict) -> str:
 
         elif nombre == "wc_comparar_precios":
             # Kame guarda el precio en el catálogo de artículos (PrecioVentaNeto, sin IVA).
-            # La web publica precios con IVA, así que se compara contra neto x 1,19.
+            # Se cruza por SKU, pero solo se compara precio si además el nombre coincide,
+            # porque en Kame hay SKU repetidos y SKU usados para otro producto.
             tol = float(args.get("tolerancia_pesos") or 1)
+            umbral = float(args.get("umbral_nombre") or 0.5)
             wc_prods = wc_get_all("/products")
             articulos = GET_TODAS_LAS_PAGINAS("/Maestro/getListArticulo", {}, max_paginas=300)
-            kame_por_sku = {str(a.get("SKU") or "").strip(): a for a in articulos if a.get("SKU")}
+            kame_por_sku = {}
+            for art in articulos:
+                k = str(art.get("SKU") or "").strip()
+                if k:
+                    kame_por_sku.setdefault(k, []).append(art)
 
             coinciden, distintos, sin_match, sin_sku, sin_precio = 0, [], [], [], []
+            nombre_distinto, duplicados = [], []
             for p in wc_prods:
                 sku = str(p.get("sku") or "").strip()
                 if not sku:
                     sin_sku.append({"id_web": p["id"], "nombre_web": p["name"]})
                     continue
-                k = kame_por_sku.get(sku)
-                if not k:
+                cands = kame_por_sku.get(sku)
+                if not cands:
                     sin_match.append({"sku": sku, "nombre_web": p["name"], "precio_web": p.get("regular_price")})
                     continue
+                puntaje = [(similitud(p["name"], c.get("Descripcion", "")), c) for c in cands]
+                puntaje.sort(key=lambda t: -t[0])
+                sim_k, k = puntaje[0]
+                if len(cands) > 1:
+                    duplicados.append({"sku": sku, "nombre_web": p["name"],
+                                       "articulos_kame": [{"descripcion": c.get("Descripcion"), "neto": c.get("PrecioVentaNeto")} for c in cands]})
+                if sim_k < umbral:
+                    nombre_distinto.append({"sku": sku, "nombre_web": p["name"], "precio_web": p.get("regular_price"),
+                                            "nombre_kame": k.get("Descripcion"), "neto_kame": k.get("PrecioVentaNeto"),
+                                            "similitud": round(sim_k, 2)})
+                    continue
                 regular = p.get("regular_price") or p.get("price") or ""
-                oferta  = p.get("sale_price") or ""
                 neto    = k.get("PrecioVentaNeto")
                 if regular == "" or neto in (None, ""):
                     sin_precio.append({"sku": sku, "nombre": p["name"], "precio_web": regular, "neto_kame": neto})
@@ -857,23 +899,28 @@ def ejecutar(nombre: str, args: dict) -> str:
                     coinciden += 1
                 else:
                     distintos.append({
-                        "sku": sku, "nombre": p["name"],
+                        "sku": sku, "nombre_web": p["name"], "nombre_kame": k.get("Descripcion"),
                         "precio_web": float(regular), "precio_kame_con_iva": bruto_kame,
                         "neto_kame": float(neto), "diferencia": dif,
-                        "en_oferta_web": oferta or None,
-                        "activo_kame": k.get("Activo"),
+                        "en_oferta_web": p.get("sale_price") or None,
+                        "activo_kame": k.get("Activo"), "similitud_nombre": round(sim_k, 2),
                     })
             distintos.sort(key=lambda x: -abs(x["diferencia"]))
             data = {
-                "criterio": f"precio regular web vs PrecioVentaNeto Kame x {1+TASA_IVA:.2f}, tolerancia {tol:g} peso(s)",
+                "criterio": (f"precio regular web vs PrecioVentaNeto Kame x {1+TASA_IVA:.2f}, tolerancia {tol:g} peso(s); "
+                             f"solo se compara precio si el nombre coincide (similitud >= {umbral:g})"),
                 "productos_web": len(wc_prods),
                 "articulos_kame": len(articulos),
                 "coinciden": coinciden,
                 "con_diferencia": len(distintos),
-                "sin_sku_en_web": len(sin_sku),
+                "sku_con_otro_producto_en_kame": len(nombre_distinto),
+                "sku_duplicado_en_kame": len(duplicados),
                 "sku_web_no_existe_en_kame": len(sin_match),
+                "sin_sku_en_web": len(sin_sku),
                 "sin_precio": len(sin_precio),
                 "diferencias": distintos,
+                "sku_con_otro_producto": nombre_distinto,
+                "sku_duplicados": duplicados,
                 "sku_no_encontrados": sin_match,
                 "sin_sku": sin_sku,
                 "sin_precio_detalle": sin_precio,
