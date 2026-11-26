@@ -468,11 +468,11 @@ TOOLS = [
     },
     {
         "name": "wc_comparar_precios",
-        "description": "Compara los precios de venta de Kame ERP con los precios publicados en bbismarck.cl (cruce por SKU). Detecta diferencias entre ambos sistemas. Ojo: Kame puede informar precios netos y la web con IVA; revisar la diferencia antes de concluir.",
+        "description": "Compara el precio regular publicado en bbismarck.cl con el PrecioVentaNeto del catálogo de artículos de Kame más IVA (cruce por SKU). Devuelve resumen, diferencias ordenadas de mayor a menor, SKU que no existen en Kame y productos sin SKU.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "lista_precio": {"type": "string", "description": "Nombre de la lista de precios de Kame a comparar (opcional)"},
+                "tolerancia_pesos": {"type": "number", "description": "Diferencia máxima en pesos para considerar que coinciden (por defecto 1)"},
             },
         },
     },
@@ -828,68 +828,55 @@ def ejecutar(nombre: str, args: dict) -> str:
             } for p in productos]
 
         elif nombre == "wc_comparar_precios":
-            # Obtiene productos de WooCommerce y lista de precios de Kame y compara
+            # Kame guarda el precio en el catálogo de artículos (PrecioVentaNeto, sin IVA).
+            # La web publica precios con IVA, así que se compara contra neto x 1,19.
+            tol = float(args.get("tolerancia_pesos") or 1)
             wc_prods = wc_get_all("/products")
-            params_k = {"nombre": args["lista_precio"]} if args.get("lista_precio") else None
-            kame_precios = GET("/Maestro/getListaPrecioVenta", params_k)
-            if isinstance(kame_precios, dict):
-                kame_precios = kame_precios.get("items") or kame_precios.get("data") or []
+            articulos = GET_TODAS_LAS_PAGINAS("/Maestro/getListArticulo", {}, max_paginas=300)
+            kame_por_sku = {str(a.get("SKU") or "").strip(): a for a in articulos if a.get("SKU")}
 
-            # Indexar Kame por SKU (nombres de campo tolerantes: la API no está documentada aquí)
-            CAMPOS_SKU = ("CodigoArticulo", "Articulo", "Codigo", "SKU", "Sku", "sku", "codigo")
-            kame_por_sku = {}
-            for p in kame_precios:
-                if not isinstance(p, dict):
-                    continue
-                sku = ""
-                for c in CAMPOS_SKU:
-                    if p.get(c):
-                        sku = str(p[c]).strip()
-                        break
-                if sku:
-                    kame_por_sku[sku] = p
-            if kame_precios and not kame_por_sku:
-                return json.dumps({"error": "No pude identificar el campo SKU en la respuesta de Kame. "
-                                   "Muestra de un registro: " + json.dumps(kame_precios[0], ensure_ascii=False)})
-
-            comparacion = []
-            sin_match = []
+            coinciden, distintos, sin_match, sin_sku, sin_precio = 0, [], [], [], []
             for p in wc_prods:
                 sku = str(p.get("sku") or "").strip()
-                precio_web = p.get("price") or p.get("regular_price") or ""
                 if not sku:
+                    sin_sku.append({"id_web": p["id"], "nombre_web": p["name"]})
                     continue
-                kame = kame_por_sku.get(sku)
-                if kame:
-                    precio_kame = ""
-                    for c in ("PrecioVenta", "Precio", "Precio1", "PrecioUnitario", "precio", "Valor"):
-                        if kame.get(c) not in (None, ""):
-                            precio_kame = kame[c]
-                            break
-                    try:
-                        pw = float(precio_web) if precio_web else None
-                        pk = float(str(precio_kame).replace(",", ".")) if precio_kame else None
-                        diferencia = round(pw - pk, 2) if pw is not None and pk is not None else None
-                        igual = abs(diferencia) < 1 if diferencia is not None else None
-                    except Exception:
-                        diferencia, igual = None, None
-                    comparacion.append({
-                        "sku": sku,
-                        "nombre_web": p["name"],
-                        "precio_web": precio_web,
-                        "precio_kame": str(precio_kame),
-                        "diferencia": diferencia,
-                        "coincide": igual,
-                    })
+                k = kame_por_sku.get(sku)
+                if not k:
+                    sin_match.append({"sku": sku, "nombre_web": p["name"], "precio_web": p.get("regular_price")})
+                    continue
+                regular = p.get("regular_price") or p.get("price") or ""
+                oferta  = p.get("sale_price") or ""
+                neto    = k.get("PrecioVentaNeto")
+                if regular == "" or neto in (None, ""):
+                    sin_precio.append({"sku": sku, "nombre": p["name"], "precio_web": regular, "neto_kame": neto})
+                    continue
+                bruto_kame = round(float(neto) * (1 + TASA_IVA))
+                dif = round(float(regular) - bruto_kame)
+                if abs(dif) <= tol:
+                    coinciden += 1
                 else:
-                    sin_match.append({"sku": sku, "nombre_web": p["name"], "precio_web": precio_web})
-
+                    distintos.append({
+                        "sku": sku, "nombre": p["name"],
+                        "precio_web": float(regular), "precio_kame_con_iva": bruto_kame,
+                        "neto_kame": float(neto), "diferencia": dif,
+                        "en_oferta_web": oferta or None,
+                        "activo_kame": k.get("Activo"),
+                    })
+            distintos.sort(key=lambda x: -abs(x["diferencia"]))
             data = {
-                "total_productos_web": len(wc_prods),
-                "con_match_kame": len(comparacion),
-                "sin_match_kame": len(sin_match),
-                "comparacion": comparacion,
-                "sin_match": sin_match,
+                "criterio": f"precio regular web vs PrecioVentaNeto Kame x {1+TASA_IVA:.2f}, tolerancia {tol:g} peso(s)",
+                "productos_web": len(wc_prods),
+                "articulos_kame": len(articulos),
+                "coinciden": coinciden,
+                "con_diferencia": len(distintos),
+                "sin_sku_en_web": len(sin_sku),
+                "sku_web_no_existe_en_kame": len(sin_match),
+                "sin_precio": len(sin_precio),
+                "diferencias": distintos,
+                "sku_no_encontrados": sin_match,
+                "sin_sku": sin_sku,
+                "sin_precio_detalle": sin_precio,
             }
 
         else:
