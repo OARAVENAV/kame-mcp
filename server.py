@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Servidor MCP para Kame ERP - Ferretería Bismarck SpA
-Versión 3.1 - URLs reales de la API oficial de Kame ERP (api.kameone.cl)
+Servidor MCP para Kame ERP + WooCommerce - Ferretería Bismarck SpA
+Versión 3.2 - Integración WooCommerce REST API (bbismarck.cl)
 + Órdenes de compra: crear, cerrar y OC referenciadas en facturas
 """
 
@@ -13,9 +13,39 @@ import requests
 from datetime import datetime, timedelta
 from typing import Any
 
-# ─── Configuración ────────────────────────────────────────────────────────────
+# ─── Configuración Kame ───────────────────────────────────────────────────────
 CLIENT_ID     = os.environ.get("KAME_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("KAME_CLIENT_SECRET", "")
+
+# ─── Configuración WooCommerce ────────────────────────────────────────────────
+WC_URL            = os.environ.get("WC_URL", "https://bbismarck.cl/wp-json/wc/v3")
+WC_CONSUMER_KEY   = os.environ.get("WC_CONSUMER_KEY", "")
+WC_CONSUMER_SECRET = os.environ.get("WC_CONSUMER_SECRET", "")
+
+def wc_get(path: str, params: dict = None) -> Any:
+    """GET a la API REST de WooCommerce."""
+    resp = requests.get(
+        f"{WC_URL}{path}",
+        auth=(WC_CONSUMER_KEY, WC_CONSUMER_SECRET),
+        params=params or {},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+def wc_get_all(path: str, extra_params: dict = None) -> list:
+    """Recorre todas las páginas de WooCommerce y devuelve todos los items."""
+    items, page = [], 1
+    while True:
+        params = {"per_page": 100, "page": page, **(extra_params or {})}
+        lote = wc_get(path, params)
+        if not isinstance(lote, list):
+            break
+        items.extend(lote)
+        if len(lote) < 100:
+            break
+        page += 1
+    return items
 BASE_URL      = "https://api.kameone.cl/api"
 AUTH_URL      = "https://api.kameone.cl/oauth/token"    # Auth0
 AUDIENCE      = "https://api.kameone.cl/api"
@@ -426,6 +456,22 @@ TOOLS = [
     },
     # ── CONTABILIDAD ──────────────────────────────────────────────────────────
     {
+        "name": "wc_productos",
+        "description": "Lista los productos publicados en bbismarck.cl (WooCommerce) con SKU, precios y stock. Permite filtrar por categoría o búsqueda.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "busqueda": {"type": "string", "description": "Texto a buscar en el nombre del producto"},
+                "categoria": {"type": "string", "description": "ID de categoría WooCommerce para filtrar"},
+            },
+        },
+    },
+    {
+        "name": "wc_comparar_precios",
+        "description": "Compara los precios de venta de Kame ERP con los precios publicados en bbismarck.cl. Detecta diferencias entre ambos sistemas.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "kame_libro_diario",
         "description": "Consulta el libro diario contable para un rango de fechas (máximo un mes).",
         "inputSchema": {
@@ -755,6 +801,79 @@ def ejecutar(nombre: str, args: dict) -> str:
             })
 
         else:
+            # ── WOOCOMMERCE ───────────────────────────────────────────────────────
+        elif nombre == "wc_productos":
+            categoria = args.get("categoria")
+            busqueda  = args.get("busqueda")
+            params = {}
+            if categoria:
+                params["category"] = categoria
+            if busqueda:
+                params["search"] = busqueda
+            productos = wc_get_all("/products", params)
+            data = [{
+                "id": p["id"],
+                "sku": p.get("sku", ""),
+                "nombre": p["name"],
+                "precio_regular": p.get("regular_price", ""),
+                "precio_venta": p.get("sale_price", ""),
+                "precio_activo": p.get("price", ""),
+                "stock": p.get("stock_quantity"),
+                "estado": p.get("status"),
+                "categorias": [c["name"] for c in p.get("categories", [])],
+            } for p in productos]
+
+        elif nombre == "wc_comparar_precios":
+            # Obtiene productos de WooCommerce y lista de precios de Kame y compara
+            wc_prods = wc_get_all("/products")
+            kame_precios = GET("/Articulo/getPreciosVenta")
+            if isinstance(kame_precios, dict):
+                kame_precios = kame_precios.get("items", [])
+
+            # Indexar Kame por SKU
+            kame_por_sku = {}
+            for p in kame_precios:
+                sku = str(p.get("CodigoArticulo") or p.get("Articulo") or "").strip()
+                if sku:
+                    kame_por_sku[sku] = p
+
+            comparacion = []
+            sin_match = []
+            for p in wc_prods:
+                sku = str(p.get("sku") or "").strip()
+                precio_web = p.get("price") or p.get("regular_price") or ""
+                if not sku:
+                    continue
+                kame = kame_por_sku.get(sku)
+                if kame:
+                    precio_kame = kame.get("Precio1") or kame.get("precio") or ""
+                    try:
+                        pw = float(precio_web) if precio_web else None
+                        pk = float(str(precio_kame).replace(",", ".")) if precio_kame else None
+                        diferencia = round(pw - pk, 2) if pw is not None and pk is not None else None
+                        igual = abs(diferencia) < 1 if diferencia is not None else None
+                    except Exception:
+                        diferencia, igual = None, None
+                    comparacion.append({
+                        "sku": sku,
+                        "nombre_web": p["name"],
+                        "precio_web": precio_web,
+                        "precio_kame": str(precio_kame),
+                        "diferencia": diferencia,
+                        "coincide": igual,
+                    })
+                else:
+                    sin_match.append({"sku": sku, "nombre_web": p["name"], "precio_web": precio_web})
+
+            data = {
+                "total_productos_web": len(wc_prods),
+                "con_match_kame": len(comparacion),
+                "sin_match_kame": len(sin_match),
+                "comparacion": comparacion,
+                "sin_match": sin_match,
+            }
+
+        else:
             return json.dumps({"error": f"Herramienta desconocida: {nombre}"})
 
         return json.dumps(data, ensure_ascii=False, indent=2)
@@ -777,7 +896,7 @@ def handle(msg: dict):
             "jsonrpc": "2.0", "id": mid,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "kame-mcp", "version": "3.2.0"},
+                "serverInfo": {"name": "kame-mcp", "version": "3.2.0"},  # WooCommerce
                 "capabilities": {"tools": {}},
             },
         })
