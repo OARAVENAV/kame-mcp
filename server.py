@@ -468,8 +468,13 @@ TOOLS = [
     },
     {
         "name": "wc_comparar_precios",
-        "description": "Compara los precios de venta de Kame ERP con los precios publicados en bbismarck.cl. Detecta diferencias entre ambos sistemas.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "description": "Compara los precios de venta de Kame ERP con los precios publicados en bbismarck.cl (cruce por SKU). Detecta diferencias entre ambos sistemas. Ojo: Kame puede informar precios netos y la web con IVA; revisar la diferencia antes de concluir.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lista_precio": {"type": "string", "description": "Nombre de la lista de precios de Kame a comparar (opcional)"},
+            },
+        },
     },
     {
         "name": "kame_libro_diario",
@@ -800,8 +805,7 @@ def ejecutar(nombre: str, args: dict) -> str:
                 "per_page": 100,
             })
 
-        else:
-            # ── WOOCOMMERCE ───────────────────────────────────────────────────────
+        # ── WOOCOMMERCE ───────────────────────────────────────────────────────
         elif nombre == "wc_productos":
             categoria = args.get("categoria")
             busqueda  = args.get("busqueda")
@@ -826,16 +830,27 @@ def ejecutar(nombre: str, args: dict) -> str:
         elif nombre == "wc_comparar_precios":
             # Obtiene productos de WooCommerce y lista de precios de Kame y compara
             wc_prods = wc_get_all("/products")
-            kame_precios = GET("/Articulo/getPreciosVenta")
+            params_k = {"nombre": args["lista_precio"]} if args.get("lista_precio") else None
+            kame_precios = GET("/Maestro/getListaPrecioVenta", params_k)
             if isinstance(kame_precios, dict):
-                kame_precios = kame_precios.get("items", [])
+                kame_precios = kame_precios.get("items") or kame_precios.get("data") or []
 
-            # Indexar Kame por SKU
+            # Indexar Kame por SKU (nombres de campo tolerantes: la API no está documentada aquí)
+            CAMPOS_SKU = ("CodigoArticulo", "Articulo", "Codigo", "SKU", "Sku", "sku", "codigo")
             kame_por_sku = {}
             for p in kame_precios:
-                sku = str(p.get("CodigoArticulo") or p.get("Articulo") or "").strip()
+                if not isinstance(p, dict):
+                    continue
+                sku = ""
+                for c in CAMPOS_SKU:
+                    if p.get(c):
+                        sku = str(p[c]).strip()
+                        break
                 if sku:
                     kame_por_sku[sku] = p
+            if kame_precios and not kame_por_sku:
+                return json.dumps({"error": "No pude identificar el campo SKU en la respuesta de Kame. "
+                                   "Muestra de un registro: " + json.dumps(kame_precios[0], ensure_ascii=False)})
 
             comparacion = []
             sin_match = []
@@ -846,7 +861,11 @@ def ejecutar(nombre: str, args: dict) -> str:
                     continue
                 kame = kame_por_sku.get(sku)
                 if kame:
-                    precio_kame = kame.get("Precio1") or kame.get("precio") or ""
+                    precio_kame = ""
+                    for c in ("PrecioVenta", "Precio", "Precio1", "PrecioUnitario", "precio", "Valor"):
+                        if kame.get(c) not in (None, ""):
+                            precio_kame = kame[c]
+                            break
                     try:
                         pw = float(precio_web) if precio_web else None
                         pk = float(str(precio_kame).replace(",", ".")) if precio_kame else None
